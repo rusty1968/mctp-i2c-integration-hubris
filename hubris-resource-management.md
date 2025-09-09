@@ -4,6 +4,80 @@
 **Date**: September 8, 2025  
 **Focus**: Resource ownership and management patterns for Platform Root of Trust (PRoT) integration in Hubris
 
+## Executive Summary
+
+Platform Root of Trust (PRoT) systems require **security isolation**, **real-time performance**, and **deterministic behavior** that traditional operating systems struggle to provide. Hubris's compile-time resource allocation enables PRoT implementations to guarantee security isolation and real-time performance through static verification. This approach ensures that:
+
+1. **Security boundaries are enforced at compilation time** - PRoT tasks cannot access each other's hardware resources without explicit IPC authorization
+2. **Real-time guarantees are statically verified** - MCTP/SPDM response times can be bounded and verified before deployment
+3. **Resource conflicts are impossible** - Hardware peripherals have single owners, eliminating runtime contention within the PRoT
+
+### **Key Insights**
+
+- **Security-First Design**: Direct hardware ownership enforces security boundaries by ensuring crypto engines, secure storage, and MCTP communication channels can only be accessed by the specific tasks that own them, preventing lateral access from other system components
+- **Real-Time Attestation**: Direct I2C ownership enables sub-10μs MCTP/SPDM protocol responses vs. 50-100μs through shared servers
+- **Compile-Time Verification**: All security boundaries are enforced at build time, preventing runtime resource conflicts that could compromise PRoT isolation
+- **Hybrid Approach**: Critical security functions use direct ownership while non-security telemetry can efficiently share resources
+
+### **PRoT Resource Strategy**
+
+| Component | Ownership Model | Rationale |
+|-----------|-----------------|-----------|
+| **MCTP Communication** | Direct | Real-time security protocols require deterministic timing |
+| **Crypto Hardware** | Direct | Security boundaries must be hardware-enforced between crypto functions |
+| **Secure Storage** | Direct | Root keys/certificates need complete isolation |
+| **Debug/Manufacturing** | Server | Controlled access with production disabling |
+| **Internal Telemetry** | Server | Non-critical PRoT status monitoring can share resources |
+
+### **Implementation Impact**
+
+- **Security**: Hardware-enforced isolation prevents lateral movement between PRoT and system functions
+- **Performance**: Direct crypto access eliminates IPC overhead for time-critical attestation operations  
+- **Reliability**: Compile-time allocation prevents runtime resource allocation failures
+- **Compliance**: Clear security boundaries simplify certification and audit processes
+
+### **Security Boundary Example**
+
+Consider a dedicated PRoT system where different tasks handle different security functions:
+
+```toml
+# ✅ GOOD: Clear security isolation within PRoT
+[tasks.prot_crypto_engine]
+uses = ["aes_engine", "ecdsa_engine", "rng"]  # Core crypto hardware
+priority = 1
+
+[tasks.prot_attestation_service]  
+# Software-only task, uses prot_crypto_engine via secure IPC
+priority = 1
+
+[tasks.prot_measurement_service]
+uses = ["flash_controller"]          # Platform measurement storage
+priority = 2                        # Cannot access crypto engines directly
+
+[tasks.prot_mctp_controller]
+uses = ["i2c1", "i2c2"]              # Secure communication channels
+priority = 1                        # Cannot access crypto engines directly
+
+# ❌ BAD: Security boundary violation within PRoT
+[tasks.shared_crypto_server]
+uses = ["aes_engine", "ecdsa_engine", "rng"]  # All crypto shared
+# Multiple PRoT functions could interfere with each other's crypto operations!
+```
+
+In the **good** example:
+- `prot_crypto_engine` has **exclusive ownership** of all crypto hardware
+- `prot_mctp_controller` **cannot directly access** crypto engines
+- `prot_measurement_service` **cannot directly access** crypto engines
+- All crypto operations go through **authenticated IPC** to the crypto engine
+- **Crypto state isolation** between different PRoT functions
+
+In the **bad** example:
+- Multiple PRoT tasks could interfere with crypto operations
+- **No isolation** between attestation crypto and measurement crypto
+- Potential for **crypto state corruption** between different security functions
+
+This document provides the technical foundation for implementing PRoT functionality in Hubris, with specific focus on MCTP integration patterns and security boundary enforcement.
+
 ## Table of Contents
 
 1. [Introduction](#introduction)
@@ -240,16 +314,39 @@ fn main() -> ! {
     let mut buffer = [0u8; 1024];
     
     loop {
-        // Block until IPC message from client arrives
-        hl::recv_without_notification(&mut buffer, |op, msg| {
-            match op {
-                Op::WriteRead => handle_write_read(&mut controllers, msg),
-                Op::WriteReadBlock => handle_block_operation(&mut controllers, msg),
-                Op::Reset => handle_reset(&mut controllers, msg),
-                _ => ResponseCode::BadArg,
+        // Wait for any notification (IPC or hardware interrupt)
+        let notification = sys_recv_notification();
+        
+        match notification {
+            // CRITICAL: Handle I2C hardware interrupts for both modes
+            I2C1_EVENT_IRQ => controllers[0].handle_event_interrupt(),
+            I2C1_ERROR_IRQ => controllers[0].handle_error_interrupt(),
+            I2C2_EVENT_IRQ => controllers[1].handle_event_interrupt(),
+            I2C2_ERROR_IRQ => controllers[1].handle_error_interrupt(),
+            
+            // Handle target/slave mode operations (MCTP incoming requests)
+            I2C1_TARGET_IRQ => controllers[0].handle_target_request(),
+            I2C2_TARGET_IRQ => controllers[1].handle_target_request(),
+            
+            // Handle client IPC requests (master/controller mode)
+            _ => {
+                recv_without_notification(&mut buffer, |op, msg| {
+                    match op {
+                        // Master/Controller mode operations
+                        Op::WriteRead => handle_write_read(&mut controllers, msg),
+                        Op::WriteReadBlock => handle_block_operation(&mut controllers, msg),
+                        Op::Reset => handle_reset(&mut controllers, msg),
+                        
+                        // Target/Slave mode operations for MCTP
+                        Op::ConfigureTarget => handle_configure_target(&mut controllers, msg),
+                        Op::SendTargetResponse => handle_target_response(&mut controllers, msg),
+                        Op::GetTargetRequest => handle_get_target_request(&mut controllers, msg),
+                        
+                        _ => ResponseCode::BadArg,
+                    }
+                });
             }
-            // Return value automatically sent back to client
-        });
+        }
     }
 }
 
@@ -548,6 +645,34 @@ fn main() -> ! {
                 });
             }
         }
+    }
+}
+```
+
+#### **Why Both Master and Target Modes Are Critical for MCTP**
+
+MCTP communication requires I2C controllers to operate in **both modes**:
+
+- **Master/Controller Mode**: PRoT initiates communication to other devices (sensors, BMC, etc.)
+- **Target/Slave Mode**: PRoT responds to incoming MCTP requests from management controllers
+
+```rust
+impl I2cController {
+    // Master mode: PRoT sends MCTP messages to other devices
+    fn send_mctp_request(&mut self, target_addr: u8, mctp_packet: &[u8]) -> Result<(), I2cError> {
+        self.operate_as_controller(target_addr, mctp_packet, None)
+    }
+    
+    // Target mode: PRoT receives and responds to MCTP requests
+    fn handle_mctp_target_request(&mut self) -> Result<MctpResponse, I2cError> {
+        let request = self.read_target_data()?;
+        let mctp_request = parse_mctp_packet(&request)?;
+        
+        // Process MCTP request (SPDM, PLDM, vendor-defined)
+        let response = self.process_mctp_request(mctp_request);
+        
+        // Send response back to requesting controller
+        self.send_target_response(&response.to_bytes())
     }
 }
 ```
